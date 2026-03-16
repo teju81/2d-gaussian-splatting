@@ -22,6 +22,7 @@ from tqdm import tqdm
 from utils.image_utils import psnr, render_net_image
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+from pathlib import Path
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -70,8 +71,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
         
         gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+
+        # Mask out black stitching boundary regions (pixels where all channels < threshold)
+        mask = (gt_image.max(dim=0).values > 5.0 / 255.0).float()  # [H, W]
+        mask_3ch = mask.unsqueeze(0)  # [1, H, W]
+        masked_image = image * mask_3ch
+        masked_gt = gt_image * mask_3ch
+
+        Ll1 = (torch.abs(masked_image - masked_gt)).sum() / (mask.sum() * 3 + 1e-8)
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(masked_image, masked_gt))
         
         # regularization
         lambda_normal = opt.lambda_normal if iteration > 7000 else 0.0
@@ -237,8 +245,10 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                         if iteration == testing_iterations[0]:
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
 
-                    l1_test += l1_loss(image, gt_image).mean().double()
-                    psnr_test += psnr(image, gt_image).mean().double()
+                    # Mask out black stitching boundary regions for evaluation
+                    eval_mask = (gt_image.max(dim=0).values > 5.0 / 255.0).float().unsqueeze(0)
+                    l1_test += l1_loss(image * eval_mask, gt_image * eval_mask).mean().double()
+                    psnr_test += psnr(image * eval_mask, gt_image * eval_mask).mean().double()
 
                 psnr_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])
@@ -248,6 +258,96 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
 
         torch.cuda.empty_cache()
+
+def find_perspective_folder(xgrids_path):
+    """Recursively find the perspective folder in the xgrids dataset.
+
+    Looks for a directory named 'perspective' containing cameras.txt,
+    images.txt, and an images/ subdirectory.
+    """
+    xgrids_path = Path(xgrids_path)
+    for candidate in sorted(xgrids_path.rglob("perspective")):
+        if not candidate.is_dir():
+            continue
+        has_cameras = (candidate / "cameras.txt").exists()
+        has_images_txt = (candidate / "images.txt").exists()
+        has_images_dir = (candidate / "images").is_dir()
+        if has_cameras and has_images_txt and has_images_dir:
+            return candidate
+    return None
+
+def prepare_xgrids_dataset(xgrids_path):
+    """Prepare a COLMAP-compatible dataset from an xgrids dataset.
+
+    Creates a new folder <xgrids_parent>/<dataset_name>_2DGS/ with:
+      - images/ : symlinks preserving camera_0/camera_1 subdirectory structure
+      - sparse/0/ : symlinks to cameras.txt, images.txt, points3D.txt
+
+    Returns (source_path, model_path) to use for training.
+    """
+    xgrids_path = Path(xgrids_path).resolve()
+    if not xgrids_path.is_dir():
+        print(f"Error: xgrids dataset path does not exist: {xgrids_path}")
+        sys.exit(1)
+
+    perspective_path = find_perspective_folder(xgrids_path)
+    if perspective_path is None:
+        print(f"Error: Could not find a valid 'perspective' folder in {xgrids_path}")
+        print("Expected: a 'perspective/' directory containing cameras.txt, images.txt, and images/ subdirectory")
+        sys.exit(1)
+
+    print(f"Found perspective folder: {perspective_path}")
+
+    # Verify required COLMAP files
+    required_files = ["cameras.txt", "images.txt", "points3D.txt"]
+    for f in required_files:
+        fpath = perspective_path / f
+        if not fpath.exists():
+            print(f"Error: Required file '{f}' not found in {perspective_path}")
+            sys.exit(1)
+        if fpath.stat().st_size == 0:
+            print(f"Error: Required file '{f}' is empty in {perspective_path}")
+            sys.exit(1)
+
+    # Verify images exist
+    images_src = perspective_path / "images"
+    image_files = list(images_src.rglob("*.jpg")) + list(images_src.rglob("*.png")) + list(images_src.rglob("*.jpeg"))
+    if not image_files:
+        print(f"Error: No images found in {images_src}")
+        sys.exit(1)
+    print(f"Found {len(image_files)} images in perspective folder")
+
+    # Create output directories inside the dataset folder
+    parent_dir = xgrids_path
+    dataset_name = xgrids_path.name
+    colmap_dir = parent_dir / f"{dataset_name}_2DGS"
+    output_dir = parent_dir / f"{dataset_name}_2DGS_output"
+    sparse_dir = colmap_dir / "sparse" / "0"
+    colmap_images_dir = colmap_dir / "images"
+
+    sparse_dir.mkdir(parents=True, exist_ok=True)
+    colmap_images_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Symlink images preserving subdirectory structure (camera_0/, camera_1/)
+    for img_path in image_files:
+        rel_path = img_path.relative_to(images_src)
+        link_path = colmap_images_dir / rel_path
+        link_path.parent.mkdir(parents=True, exist_ok=True)
+        if not link_path.exists():
+            link_path.symlink_to(img_path)
+
+    # Symlink COLMAP files into sparse/0/
+    for f in required_files:
+        src = perspective_path / f
+        dst = sparse_dir / f
+        if not dst.exists():
+            dst.symlink_to(src)
+
+    print(f"Created COLMAP dataset: {colmap_dir}")
+    print(f"Output directory: {output_dir}")
+
+    return str(colmap_dir), str(output_dir)
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -263,9 +363,17 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("-x", "--xgrids", type=str, default=None,
+                        help="Path to xgrids dataset root. Auto-creates COLMAP-compatible structure from perspective folder.")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
-    
+
+    # If xgrids mode, prepare dataset and override source/model paths
+    if args.xgrids:
+        source_path, model_path = prepare_xgrids_dataset(args.xgrids)
+        args.source_path = source_path
+        args.model_path = model_path
+
     print("Optimizing " + args.model_path)
 
     # Initialize system state (RNG)

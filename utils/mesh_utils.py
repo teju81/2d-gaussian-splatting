@@ -279,6 +279,100 @@ class GaussianExtractor(object):
         return mesh
 
     @torch.no_grad()
+    def extract_mesh_nvblox(self, voxel_size=0.02, max_integration_distance=5.0, mask_background=True):
+        """
+        Perform TSDF fusion using nvblox GPU-accelerated backend.
+
+        voxel_size: the voxel size of the volume (meters)
+        max_integration_distance: maximum depth range to integrate (meters)
+        mask_background: whether to mask background, only works when the dataset has masks
+
+        return o3d.mesh
+        """
+        import tempfile
+        from nvblox_torch.mapper import Mapper
+        from nvblox_torch.mapper_params import MapperParams, ProjectiveIntegratorParams
+
+        print("Running nvblox GPU TSDF integration ...")
+        print(f'voxel_size: {voxel_size}')
+        print(f'max_integration_distance: {max_integration_distance}')
+
+        # Configure nvblox mapper
+        projective_integrator_params = ProjectiveIntegratorParams()
+        projective_integrator_params.projective_integrator_max_integration_distance_m = max_integration_distance
+
+        mapper_params = MapperParams()
+        mapper_params.set_projective_integrator_params(projective_integrator_params)
+
+        mapper = Mapper(
+            voxel_sizes_m=voxel_size,
+            mapper_parameters=mapper_params,
+        )
+
+        _ALIGN = 8  # nvblox requires dimensions divisible by 8
+
+        for i, viewpoint_cam in tqdm(enumerate(self.viewpoint_stack), desc="nvblox TSDF integration"):
+            rgb = self.rgbmaps[i]
+            depth = self.depthmaps[i]
+
+            # Apply background mask if available
+            if mask_background and (viewpoint_cam.gt_alpha_mask is not None):
+                depth = depth.clone()
+                depth[(viewpoint_cam.gt_alpha_mask.cpu() < 0.5)] = 0
+
+            # Extract intrinsics (same math as to_cam_open3d)
+            W = viewpoint_cam.image_width
+            H = viewpoint_cam.image_height
+            ndc2pix = torch.tensor([
+                [W / 2, 0, 0, (W-1) / 2],
+                [0, H / 2, 0, (H-1) / 2],
+                [0, 0, 0, 1]]).float().cuda().T
+            intrins = (viewpoint_cam.projection_matrix @ ndc2pix)[:3,:3].T
+            intrinsics = torch.tensor([
+                [intrins[0,0].item(), 0.0, intrins[0,2].item()],
+                [0.0, intrins[1,1].item(), intrins[1,2].item()],
+                [0.0, 0.0, 1.0],
+            ], dtype=torch.float32)
+
+            # Camera-to-world pose (nvblox expects c2w)
+            w2c = viewpoint_cam.world_view_transform.T  # [4, 4]
+            pose = torch.inverse(w2c).cpu().float()
+
+            # Depth: [1, H, W] -> [H, W] float32 on CUDA
+            depth_gpu = depth.squeeze(0).cuda().float().contiguous()
+
+            # Color: [3, H, W] -> [H, W, 3] uint8 on CUDA
+            color_gpu = (rgb.permute(1, 2, 0).clamp(0.0, 1.0) * 255).to(torch.uint8).cuda().contiguous()
+
+            # Ensure dimensions are divisible by 8
+            h, w = depth_gpu.shape
+            new_h = (h // _ALIGN) * _ALIGN
+            new_w = (w // _ALIGN) * _ALIGN
+            if new_h != h or new_w != w:
+                depth_gpu = depth_gpu[:new_h, :new_w].contiguous()
+                color_gpu = color_gpu[:new_h, :new_w].contiguous()
+
+            mapper.add_depth_frame(depth_gpu, pose, intrinsics)
+            mapper.add_color_frame(color_gpu, pose, intrinsics)
+
+        # Extract colored mesh
+        print("Extracting mesh from nvblox ...")
+        mapper.update_color_mesh()
+        color_mesh = mapper.get_color_mesh()
+
+        # Save to temp file, reload as Open3D mesh for consistent return type
+        with tempfile.NamedTemporaryFile(suffix='.ply', delete=False) as tmp:
+            tmp_path = tmp.name
+        color_mesh.save(tmp_path)
+        mesh = o3d.io.read_triangle_mesh(tmp_path)
+        os.remove(tmp_path)
+
+        if not mesh.has_vertex_normals():
+            mesh.compute_vertex_normals()
+
+        return mesh
+
+    @torch.no_grad()
     def export_image(self, path):
         render_path = os.path.join(path, "renders")
         gts_path = os.path.join(path, "gt")

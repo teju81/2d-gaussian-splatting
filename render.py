@@ -41,6 +41,8 @@ if __name__ == "__main__":
     parser.add_argument("--sdf_trunc", default=-1.0, type=float, help='Mesh: truncation value for TSDF')
     parser.add_argument("--num_cluster", default=50, type=int, help='Mesh: number of connected clusters to export')
     parser.add_argument("--unbounded", action="store_true", help='Mesh: using unbounded mode for meshing')
+    parser.add_argument("--nvblox", action="store_true", help='Mesh: use nvblox GPU TSDF instead of Open3D')
+    parser.add_argument("--max_integration_distance", default=5.0, type=float, help='Mesh: max depth for nvblox integration')
     parser.add_argument("--mesh_res", default=1024, type=int, help='Mesh: resolution for unbounded mesh extraction')
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)
@@ -90,7 +92,14 @@ if __name__ == "__main__":
         gaussExtractor.gaussians.active_sh_degree = 0
         gaussExtractor.reconstruction(scene.getTrainCameras())
         # extract the mesh and save
-        if args.unbounded:
+        if args.nvblox:
+            name = 'fuse_nvblox.ply'
+            voxel_size = 0.02 if args.voxel_size < 0 else args.voxel_size
+            mesh = gaussExtractor.extract_mesh_nvblox(
+                voxel_size=voxel_size,
+                max_integration_distance=args.max_integration_distance,
+            )
+        elif args.unbounded:
             name = 'fuse_unbounded.ply'
             mesh = gaussExtractor.extract_mesh_unbounded(resolution=args.mesh_res)
         else:

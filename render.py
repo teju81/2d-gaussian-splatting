@@ -109,6 +109,10 @@ if __name__ == "__main__":
             sdf_trunc = 5.0 * voxel_size if args.sdf_trunc < 0 else args.sdf_trunc
             mesh = gaussExtractor.extract_mesh_bounded(voxel_size=voxel_size, sdf_trunc=sdf_trunc, depth_trunc=depth_trunc)
         
+        # Merge close vertices for nvblox meshes to connect block boundaries
+        if args.nvblox:
+            mesh.merge_close_vertices(voxel_size * 0.5)
+
         o3d.io.write_triangle_mesh(os.path.join(train_dir, name), mesh)
         print("mesh saved at {}".format(os.path.join(train_dir, name)))
         # post-process the mesh and save, saving the largest N clusters

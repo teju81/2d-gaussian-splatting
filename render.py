@@ -43,6 +43,7 @@ if __name__ == "__main__":
     parser.add_argument("--unbounded", action="store_true", help='Mesh: using unbounded mode for meshing')
     parser.add_argument("--nvblox", action="store_true", help='Mesh: use nvblox GPU TSDF instead of Open3D')
     parser.add_argument("--max_integration_distance", default=5.0, type=float, help='Mesh: max depth for nvblox integration')
+    parser.add_argument("--skimage_mc", action="store_true", help='Mesh: use scikit-image marching cubes on dense TSDF grid instead of nvblox built-in extraction (requires --nvblox)')
     parser.add_argument("--mesh_res", default=1024, type=int, help='Mesh: resolution for unbounded mesh extraction')
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)
@@ -93,11 +94,12 @@ if __name__ == "__main__":
         gaussExtractor.reconstruction(scene.getTrainCameras())
         # extract the mesh and save
         if args.nvblox:
-            name = 'fuse_nvblox.ply'
+            name = 'fuse_nvblox_skimage.ply' if args.skimage_mc else 'fuse_nvblox.ply'
             voxel_size = 0.02 if args.voxel_size < 0 else args.voxel_size
             mesh = gaussExtractor.extract_mesh_nvblox(
                 voxel_size=voxel_size,
                 max_integration_distance=args.max_integration_distance,
+                use_skimage_mc=args.skimage_mc,
             )
         elif args.unbounded:
             name = 'fuse_unbounded.ply'

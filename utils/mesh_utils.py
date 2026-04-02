@@ -32,6 +32,7 @@ def post_process_mesh(mesh, cluster_to_keep=1000):
     triangle_clusters = np.asarray(triangle_clusters)
     cluster_n_triangles = np.asarray(cluster_n_triangles)
     cluster_area = np.asarray(cluster_area)
+    cluster_to_keep = min(cluster_to_keep, len(cluster_n_triangles))
     n_cluster = np.sort(cluster_n_triangles.copy())[-cluster_to_keep]
     n_cluster = max(n_cluster, 50) # filter meshes smaller than 50
     triangles_to_remove = cluster_n_triangles[triangle_clusters] < n_cluster
@@ -300,24 +301,32 @@ class GaussianExtractor(object):
         return o3d.mesh
         """
         import tempfile
+        print("importing nvblox...", flush=True)
         from nvblox_torch.mapper import Mapper
+        print("nvblox Mapper imported", flush=True)
         from nvblox_torch.mapper_params import MapperParams, ProjectiveIntegratorParams
+        from nvblox_torch.sensor import Sensor
+        print("nvblox MapperParams imported", flush=True)
 
         print("Running nvblox GPU TSDF integration ...")
         print(f'voxel_size: {voxel_size}')
         print(f'max_integration_distance: {max_integration_distance}')
 
         # Configure nvblox mapper
+        print("creating ProjectiveIntegratorParams...", flush=True)
         projective_integrator_params = ProjectiveIntegratorParams()
         projective_integrator_params.projective_integrator_max_integration_distance_m = max_integration_distance
 
+        print("creating MapperParams...", flush=True)
         mapper_params = MapperParams()
         mapper_params.set_projective_integrator_params(projective_integrator_params)
 
+        print("creating Mapper...", flush=True)
         mapper = Mapper(
             voxel_sizes_m=voxel_size,
             mapper_parameters=mapper_params,
         )
+        print("Mapper created successfully", flush=True)
 
         _ALIGN = 8  # nvblox requires dimensions divisible by 8
 
@@ -362,8 +371,11 @@ class GaussianExtractor(object):
                 depth_gpu = depth_gpu[:new_h, :new_w].contiguous()
                 color_gpu = color_gpu[:new_h, :new_w].contiguous()
 
-            mapper.add_depth_frame(depth_gpu, pose, intrinsics)
-            mapper.add_color_frame(color_gpu, pose, intrinsics)
+            # Create nvblox Sensor from intrinsics matrix
+            sensor = Sensor.from_camera_matrix(intrinsics, new_w, new_h)
+
+            mapper.add_depth_frame(depth_gpu, pose, sensor)
+            mapper.add_color_frame(color_gpu, pose, sensor)
 
         if use_skimage_mc:
             # Extract dense TSDF grid and run scikit-image marching cubes

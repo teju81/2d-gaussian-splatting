@@ -16,7 +16,7 @@ from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
-from utils.general_utils import safe_state
+from utils.general_utils import safe_state, get_expon_lr_func
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr, render_net_image
@@ -29,15 +29,47 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, incremental=False):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
     if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
+        (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
         gaussians.restore(model_params, opt)
+
+    # Incremental mode: shift densification window and position LR schedule
+    # relative to the checkpoint iteration so new Gaussians can be created
+    # for scene changes.
+    checkpoint_iter = 0
+    if incremental and checkpoint and first_iter > 0:
+        checkpoint_iter = first_iter
+        opt.densify_from_iter = checkpoint_iter + 500
+        opt.densify_until_iter = checkpoint_iter + int(
+            (opt.iterations - checkpoint_iter) * 0.5
+        )
+        opt.opacity_reset_interval = 3000
+        # Rebuild position LR schedule relative to checkpoint iteration
+        gaussians.xyz_scheduler_args = get_expon_lr_func(
+            lr_init=opt.position_lr_init * gaussians.spatial_lr_scale,
+            lr_final=opt.position_lr_final * gaussians.spatial_lr_scale,
+            lr_delay_mult=opt.position_lr_delay_mult,
+            max_steps=opt.iterations - checkpoint_iter,
+        )
+        # Reset gradient accumulators so densification starts fresh
+        gaussians.xyz_gradient_accum = torch.zeros(
+            (gaussians.get_xyz.shape[0], 1), device="cuda"
+        )
+        gaussians.denom = torch.zeros(
+            (gaussians.get_xyz.shape[0], 1), device="cuda"
+        )
+        gaussians.max_radii2D = torch.zeros(
+            (gaussians.get_xyz.shape[0]), device="cuda"
+        )
+        print(f"[Incremental] Checkpoint at iter {checkpoint_iter}")
+        print(f"[Incremental] Densification window: {opt.densify_from_iter} - {opt.densify_until_iter}")
+        print(f"[Incremental] Position LR schedule reset for {opt.iterations - checkpoint_iter} steps")
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -52,11 +84,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
-    for iteration in range(first_iter, opt.iterations + 1):        
+    for iteration in range(first_iter, opt.iterations + 1):
 
         iter_start.record()
 
-        gaussians.update_learning_rate(iteration)
+        # In incremental mode, offset iteration for LR schedule so it
+        # starts from lr_init at the checkpoint boundary.
+        if incremental and checkpoint_iter > 0:
+            gaussians.update_learning_rate(iteration - checkpoint_iter)
+        else:
+            gaussians.update_learning_rate(iteration)
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
@@ -365,6 +402,9 @@ if __name__ == "__main__":
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("-x", "--xgrids", type=str, default=None,
                         help="Path to xgrids dataset root. Auto-creates COLMAP-compatible structure from perspective folder.")
+    parser.add_argument("--incremental", action="store_true",
+                        help="Incremental training mode: re-enable densification and reset "
+                             "position LR schedule relative to checkpoint iteration.")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
 
@@ -382,7 +422,7 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, incremental=args.incremental)
 
     # All done
     print("\nTraining complete.")

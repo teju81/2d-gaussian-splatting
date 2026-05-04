@@ -17,7 +17,8 @@ from utils.graphics_utils import getWorld2View2, getProjectionMatrix
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
                  image_name, uid,
-                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda"
+                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda",
+                 image_path=None,
                  ):
         super(Camera, self).__init__()
 
@@ -28,6 +29,10 @@ class Camera(nn.Module):
         self.FoVx = FoVx
         self.FoVy = FoVy
         self.image_name = image_name
+        # Full path incl. subdir (camera_0/..., camera_1/...). Preserved because
+        # 2DGS's default image_name truncates at the first dot, losing the
+        # fractional-seconds timestamp needed to disambiguate frames.
+        self.image_path = image_path
 
         try:
             self.data_device = torch.device(data_device)
